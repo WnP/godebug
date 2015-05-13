@@ -353,7 +353,7 @@ Commands:
     (s) step: Run for one step.
     (c) continue: Run until the next breakpoint.
     (l) list: Show the current line in context of the code around it.
-    (p) print <var>: Print a variable.
+    (p) print [<format-specifier>] <var>: Print a variable, optionaly use printf format specifier.
 
 Commands may be given by their full name or by their parenthesized abbreviation.
 Any input that is not one of the above commands is interpreted as a variable name.
@@ -401,14 +401,20 @@ func waitForInput(scope *Scope, line int) {
 		}
 		fields := strings.Fields(s)
 		if len(fields) > 0 && (fields[0] == "p" || fields[0] == "print") {
-			if len(fields) == 2 {
-				if v, ok := scope.getIdent(strings.TrimSpace(fields[1])); ok {
-					fmt.Printf("%#v\n", v)
+			if len(fields) == 2 || len(fields) == 3 {
+				if v, ok := scope.getIdent(strings.TrimSpace(fields[len(fields)-1])); ok {
+					if len(fields) == 3 {
+						fmt.Printf(fields[1]+"\n", v)
+					} else {
+						fmt.Printf("%#v\n", v)
+					}
 				} else {
-					fmt.Printf("%s is not in scope (or is in package scope). Can't print it.\n", fields[1])
+					fmt.Printf(
+						"%s is not in scope (or is in package scope). Can't print it.\n",
+						fields[len(fields)-1])
 				}
 			} else {
-				fmt.Println("usage: print <var>")
+				fmt.Println("usage: print [<format-specifier>] <var>")
 			}
 			continue
 		}
