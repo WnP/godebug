@@ -354,9 +354,9 @@ Commands:
     (c) continue: Run until the next breakpoint.
     (l) list: Show the current line in context of the code around it.
     (p) print [<format-specifier>] <var>: Print a variable, optionaly use printf format specifier.
+    (q) quit: Exit the program. Uses os.Exit; deferred functions are not run.
 
 Commands may be given by their full name or by their parenthesized abbreviation.
-Any input that is not one of the above commands is interpreted as a variable name.
 
 Pressing enter without typing anything repeats the previous command.
 `
@@ -394,10 +394,8 @@ func waitForInput(scope *Scope, line int) {
 		case "l", "list":
 			printContext(scope.fileText, line, 4)
 			continue
-		}
-		if v, ok := scope.getIdent(strings.TrimSpace(s)); ok {
-			fmt.Printf("%#v\n", v)
-			continue
+		case "q", "quit":
+			os.Exit(0)
 		}
 		fields := strings.Fields(s)
 		if len(fields) > 0 && (fields[0] == "p" || fields[0] == "print") {
@@ -418,7 +416,10 @@ func waitForInput(scope *Scope, line int) {
 			}
 			continue
 		}
-		fmt.Println("Command not recognized, sorry!")
+		fmt.Println(`Invalid command. Try "help".`)
+		if _, ok := scope.getIdent(strings.TrimSpace(s)); ok {
+			fmt.Printf("If you want to print the variable %s, use the print command.\n", strings.TrimSpace(s))
+		}
 	}
 }
 

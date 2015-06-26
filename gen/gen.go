@@ -8,6 +8,7 @@ import (
 	"go/printer"
 	"go/token"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,11 +17,12 @@ import (
 	"unicode"
 
 	"github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/ast/astutil"
+	"github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/exact"
+	_ "github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/gccgoimporter"
 	_ "github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/gcimporter"
 	"github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/loader"
 	"github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/types"
 	_ "github.com/mailgun/godebug/lib" // so the library is also installed whenever this package is
-	_ "golang.org/x/tools/go/gccgoimporter"
 )
 
 var (
@@ -39,6 +41,11 @@ func Generate(prog *loader.Program, getFileBytes func(string) ([]byte, error), w
 		defs = pkgInfo.Defs
 		_types = pkgInfo.Types
 		pkg = pkgInfo.Pkg
+		path := pkg.Path()
+		if !pkgInfo.Importable && strings.HasSuffix(pkgInfo.Pkg.Name(), "_test") {
+			// EXTERNAL TEST package, strip the _test to find the path
+			path = strings.TrimSuffix(pkg.Path(), "_test")
+		}
 		for _, f := range pkgInfo.Files {
 			fs = prog.Fset
 			fname := fs.Position(f.Pos()).Filename
@@ -65,7 +72,7 @@ func Generate(prog *loader.Program, getFileBytes func(string) ([]byte, error), w
 			}
 			astutil.AddNamedImport(fs, f, importName, "github.com/mailgun/godebug/lib")
 			cfg := printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 8}
-			out := writerFor(pkg.Path(), fname)
+			out := writerFor(path, fname)
 			defer out.Close()
 			_ = cfg.Fprint(out, fs, f)
 			fmt.Fprintln(out, "\nvar", idents.fileContents, "=", quotedContents)
@@ -273,7 +280,7 @@ func genEnterFunc(fn *ast.FuncDecl, inputs, outputs []ast.Expr) (stmts []ast.Stm
 	// Is this a method call or a function call?
 	if fn.Recv != nil {
 		// Is the receiver named or anonymous?
-		if len(fn.Recv.List[0].Names) == 0 {
+		if len(fn.Recv.List[0].Names) == 0 || fn.Recv.List[0].Names[0].Name == "_" {
 			pseudoIdent = newSel(idents.receiver, fn.Name.Name)
 			recvType = fn.Recv.List[0].Type
 		} else {
@@ -745,8 +752,8 @@ func newIdentsCall(scopeVar string, newIdents []*ast.Ident, isConst bool) ast.St
 		call.Args[2*i] = newStringLit(strconv.Quote(ident.Name))
 
 		if isConst {
-			// Pass the value if constant.
-			call.Args[2*i+1] = ident
+			// Pass the value if constant. Cast it if it doesn't fit an int32.
+			call.Args[2*i+1] = castIfOverflow(ident)
 		} else {
 			// Pass a pointer if variable.
 			call.Args[2*i+1] = &ast.UnaryExpr{
@@ -756,6 +763,29 @@ func newIdentsCall(scopeVar string, newIdents []*ast.Ident, isConst bool) ast.St
 		}
 	}
 	return expr
+}
+
+var (
+	minInt32 = exact.MakeInt64(math.MinInt32)
+	maxInt32 = exact.MakeInt64(math.MaxInt32)
+)
+
+func castIfOverflow(ident *ast.Ident) ast.Expr {
+	c, ok := defs[ident].(*types.Const)
+	if !ok || c == nil {
+		return ident
+	}
+	v := c.Val()
+	switch {
+	case v.Kind() != exact.Int:
+		return ident
+	case exact.Compare(v, token.LSS, minInt32):
+		return &ast.CallExpr{Fun: ast.NewIdent("int64"), Args: []ast.Expr{ident}}
+	case exact.Compare(v, token.GTR, maxInt32):
+		return &ast.CallExpr{Fun: ast.NewIdent("uint64"), Args: []ast.Expr{ident}}
+	default:
+		return ident
+	}
 }
 
 func (v *visitor) createScope() {

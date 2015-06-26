@@ -15,11 +15,9 @@ import (
 	"strconv"
 	"strings"
 
-	"bitbucket.org/JeremySchlatter/go-atexit"
-	"github.com/kisielk/gotool"
-
+	"github.com/mailgun/godebug/Godeps/_workspace/src/bitbucket.org/JeremySchlatter/go-atexit"
+	"github.com/mailgun/godebug/Godeps/_workspace/src/github.com/kisielk/gotool"
 	"github.com/mailgun/godebug/Godeps/_workspace/src/golang.org/x/tools/go/loader"
-
 	"github.com/mailgun/godebug/gen"
 )
 
@@ -27,9 +25,16 @@ var (
 	outputFlags flag.FlagSet
 	w           = outputFlags.Bool("w", false, "write result to (source) file instead of stdout")
 
-	runTestFlags flag.FlagSet
-	instrument   = runTestFlags.String("instrument", "", "extra packages to enable for debugging")
-	work         = runTestFlags.Bool("godebugwork", false, "print the name of the temporary work directory and do not delete it when exiting")
+	runFlags   flag.FlagSet
+	instrument = runFlags.String("instrument", "", "extra packages to enable for debugging")
+	work       = runFlags.Bool("godebugwork", false, "print the name of the temporary work directory and do not delete it when exiting")
+	tags       = runFlags.String("tags", "", "go build tags")
+
+	buildFlags = runFlags
+	o          = buildFlags.String("o", "", "output binary name")
+
+	testFlags = buildFlags
+	c         = testFlags.Bool("c", false, "compile the test binary but do not run it")
 )
 
 func init() {
@@ -50,24 +55,16 @@ Usage:
 
 The commands are:
 
+    build     compile a debug-ready Go program
     run       compile, run, and debug a Go program
     test      compile, run, and debug Go package tests
-    output    generate debug source code, but do not build or run it
 
 Use "godebug help [command]" for more information about a command.
 `)
 	exit(0)
 }
 
-func runUsage() {
-	log.Print(
-		`usage: godebug run [-godebugwork] [-instrument pkgs...] gofiles... [--] [arguments...]
-
-Run is a wrapper around 'go run'. It generates debugging code for
-the named Go source files and runs 'go run' on the result.
-
-Optionally, a '--' argument ends the list of gofiles.
-
+const commonArgsUsage = `
 By default, godebug generates debugging code only for the named
 Go source files, and not their dependencies. This means that in
 the debugging session you will not be able to step into function
@@ -77,30 +74,54 @@ must not be relative.
 
 If -godebugwork is set, godebug will print the name of the
 temporary work directory and not delete it when exiting.
-`)
+
+-tags works like in 'go help build'.
+`
+
+func runUsage() {
+	log.Print(
+		`usage: godebug run [-godebugwork] [-instrument pkgs...] [-tags 'tag list'] gofiles... [--] [arguments...]
+
+Run emulates 'go run' behavior. It generates debugging code for the
+named *.go files and then compiles and executes the result.
+
+Like 'go run' it takes a list of go files which are treated as a
+single main package. The rest of the arguments is passed to the
+binary. Optionally, a '--' argument ends the list of gofiles.
+` + commonArgsUsage)
+}
+
+func buildUsage() {
+	log.Print(
+		`usage: godebug build [-godebugwork] [-instrument pkgs...] [-tags 'tag list'] [-o output] [package]
+
+Build is a wrapper around 'go build'. It generates debugging code for
+the named target and builds the result.
+
+Like 'go build' it takes a single main package. If arguments are a list
+of *.go files they are treated as a single package. Relative packages are
+not supported - which means you can't leave the package name out, too.
+
+The output file naming if -o is not passed works like 'go build' (see
+'go help build') with the addition of the suffix '.debug'.
+` + commonArgsUsage)
 }
 
 func testUsage() {
 	log.Print(
-		`usage: godebug test [-godebugwork] [-instrument pkgs...] [packages] [flags for test binary]
+		`usage: godebug test [-godebugwork] [-instrument pkgs...] [-tags 'tag list'] [-c] [-o output] [packages] [flags for test binary]
 
 Test is a wrapper around 'go test'. It generates debugging code for
 the tests in the named packages and runs 'go test' on the result.
 
 As with 'go test', by default godebug test needs no arguments.
 
-By default, godebug generates debugging code only for the named
-packages, and not their dependencies. This means that in the
-debugging session you will not be able to step into function
-calls from imported packages. To instrument other packages,
-pass the -instrument flag. Packages are comma-separated and
-must not be relative.
+Flags parsing, -c and -o work like for 'go test' - see 'go help test'.
+The default binary name for -c has the suffix '.test.debug'.
 
-If -godebugwork is set, godebug will print the name of the
-temporary work directory and not delete it when exiting.
-
-See also: 'go help testflag'.
-`)
+See also: 'go help testflag'. Note that you have to use the 'test.'
+prefix like '-test.v'.
+` + commonArgsUsage)
 }
 
 func outputUsage() {
@@ -150,6 +171,8 @@ func main() {
 		doOutput(os.Args[2:])
 	case "run":
 		doRun(os.Args[2:])
+	case "build":
+		doBuild(os.Args[2:])
 	case "test":
 		doTest(os.Args[2:])
 	default:
@@ -166,6 +189,8 @@ func doHelp(args []string) {
 		outputUsage()
 	case "run":
 		runUsage()
+	case "build":
+		buildUsage()
 	case "test":
 		testUsage()
 	default:
@@ -173,9 +198,43 @@ func doHelp(args []string) {
 	}
 }
 
+func doBuild(args []string) {
+	exitIfErr(buildFlags.Parse(args))
+	goArgs, isPkg := parseBuildArguments(buildFlags.Args())
+
+	conf := newLoader()
+	if isPkg {
+		conf.Import(goArgs[0])
+	} else {
+		exitIfErr(conf.CreateFromFilenames("main", goArgs...))
+	}
+
+	tmpDir := generateSourceFiles(&conf, "build")
+	tmpFile := filepath.Join(tmpDir, "godebug.-i.a.out")
+
+	// Run 'go build -i' once without changing the GOPATH.
+	// This will recompile and install any out-of-date packages.
+	// When we modify the GOPATH in the next invocation of the go tool, it will
+	// not check if any of the uninstrumented dependencies are out-of-date.
+	shellGo("", []string{"build", "-o", tmpFile, "-tags", *tags, "-i"}, goArgs)
+
+	if isPkg {
+		goArgs = mapPkgsToTmpDir(goArgs)
+	} else {
+		goArgs = mapToTmpDir(tmpDir, goArgs)
+	}
+
+	bin := filepath.Base(strings.TrimSuffix(goArgs[0], ".go")) + ".debug"
+	if *o != "" {
+		bin = *o
+	}
+
+	shellGo(tmpDir, []string{"build", "-o", bin, "-tags", *tags}, goArgs)
+}
+
 func doRun(args []string) {
 	// Parse arguments.
-	exitIfErr(runTestFlags.Parse(args))
+	exitIfErr(runFlags.Parse(args))
 
 	// Separate the .go files from the arguments to the binary we're building.
 	gofiles, rest := getGoFiles()
@@ -184,22 +243,24 @@ func doRun(args []string) {
 	}
 
 	// Build a loader.Config from the .go files.
-	var conf loader.Config
+	conf := newLoader()
 	exitIfErr(conf.CreateFromFilenames("main", gofiles...))
 
 	tmpDir := generateSourceFiles(&conf, "run")
 
 	// Run 'go build -i' once without changing the GOPATH.
 	// This will recompile and install any out-of-date packages.
-	// When we modify the GOPATH in the next invocation of the go tool,
-	// it will not check if any of the uninstrumented dependencies are out-of-date.
-	shellGo("", []string{"build", "-o", os.DevNull, "-i"}, gofiles)
+	// When we modify the GOPATH in the next invocation of the go tool, it will
+	// not check if any of the uninstrumented dependencies are out-of-date.
+	shellGo("", []string{"build", "-o", os.DevNull, "-tags", *tags, "-i"},
+		gofiles)
 
 	// Run 'go build', then run the binary.
-	// We do this rather than invoking 'go run' directly so we can implement the '--' argument,
-	// which 'go run' does not have.
+	// We do this rather than invoking 'go run' directly so we can implement
+	// the '--' argument, which 'go run' does not have.
 	bin := filepath.Join(tmpDir, "godebug.a.out")
-	shellGo(tmpDir, []string{"build", "-o", bin}, mapToTmpDir(tmpDir, gofiles))
+	shellGo(tmpDir, []string{"build", "-tags", *tags, "-o", bin},
+		mapToTmpDir(tmpDir, gofiles))
 	shell("", bin, rest...)
 }
 
@@ -212,28 +273,58 @@ func doTest(args []string) {
 		packages = []string{"."}
 	}
 
+	// Expand ...
+	packages = gotool.ImportPaths(packages)
+
+	if len(packages) > 1 && (*c || *o != "") {
+		logFatal("godebug test: cannot use -c or -o flag with multiple packages")
+	}
+
 	// Build a loader.Config from the provided packages.
-	var conf loader.Config
+	conf := newLoader()
 	for _, pkg := range packages {
 		exitIfErr(conf.ImportWithTests(pkg))
 	}
 
 	tmpDir := generateSourceFiles(&conf, "test")
+	wd := getwd()
 
 	// Run 'go test -i' once without changing the GOPATH.
 	// This will recompile and install any out-of-date packages.
 	// When we modify the GOPATH in the next invocation of the go tool,
 	// it will not check if any of the uninstrumented dependencies are out-of-date.
-	shellGo("", []string{"test", "-i"}, packages)
+	shellGo("", []string{"test", "-tags", *tags, "-i"}, packages)
+
+	// The target binary goes to -o if specified, otherwise to the default name
+	// if -c is specified, otherwise to the temporary directory.
+	bin := filepath.Join(tmpDir, "godebug-test-bin.test")
+	if *c {
+		bin = filepath.Base(mapPkgsToTmpDir(packages)[0]) + ".test.debug"
+	}
+	if *o != "" {
+		bin = abs(*o)
+	}
 
 	// First compile the test with -c and then run the binary directly.
 	// This resolves some issues that came up with running 'go test' directly:
 	//    (1) 'go test' changes the working directory to that of the source files of the test.
 	//    (2) 'go test' does not forward stdin to the test binary.
-	bin := filepath.Join(tmpDir, "godebug-test-bin.test")
-	goArgs := []string{"test", "-c", "-o", bin}
-	shellGo(tmpDir, goArgs, mapPkgsToTmpDir(packages))
-	shell("", bin, testFlags...)
+	// Do it once for each package since we can't use -c with multiple packages.
+	for _, pkg := range mapPkgsToTmpDir(packages) {
+		if len(packages) > 1 {
+			fmt.Println("===", pkg)
+			os.Remove(bin)
+		}
+		goArgs := []string{"test", "-tags", *tags, "-c", "-o", bin}
+		shellGo(tmpDir, goArgs, []string{pkg})
+		// Skip execution if no binary was generated (no test files) or -c was passed
+		if _, err := os.Stat(bin); err == nil && !*c {
+			_, dir := findUnderGopath(wd, pkg)
+			os.Chdir(dir)
+			shell("", bin, testFlags...)
+			os.Chdir(wd)
+		}
+	}
 }
 
 func generateSourceFiles(conf *loader.Config, subcommand string) (tmpDirPath string) {
@@ -307,13 +398,21 @@ func generateSourceFiles(conf *loader.Config, subcommand string) (tmpDirPath str
 		if importPath == "main" {
 			filename = filepath.Join(tmpDir, filepath.Base(filename))
 		} else {
-			importPath = findUnderGopath(wd, importPath)
+			importPath, _ = findUnderGopath(wd, importPath)
 			exitIfErr(os.MkdirAll(filepath.Join(tmpDir, "src", importPath), 0770))
 			filename = filepath.Join(tmpDir, "src", importPath, filepath.Base(filename))
 		}
 		return createFileHook(filename, tmpDir)
 	})
 	return tmpDir
+}
+
+func newLoader() loader.Config {
+	var conf loader.Config
+	b := build.Default
+	b.BuildTags = append(b.BuildTags, strings.Split(*tags, " ")...)
+	conf.Build = &b
+	return conf
 }
 
 func checkForUnusedBreakpoints(subcommand string, prog *loader.Program, stdLib map[string]bool) {
@@ -348,8 +447,8 @@ func markAlmostAllPackages(prog *loader.Program, stdLib map[string]bool) {
 		// skip this package if...
 		case stdLib[path]: // it's part of the standard library
 		case prog.ImportMap[path] == nil: // it's a Created package
-		case path == "github.com/mailgun/godebug/lib": // it's the godebug library
-		case path == "github.com/jtolds/gls": // it's a dependency of the godebug library
+		case strings.HasPrefix(path, "github.com/mailgun/godebug"):
+			// it's the godebug library or one of its dependecies
 
 		// otherwise include it
 		default:
@@ -359,13 +458,13 @@ func markAlmostAllPackages(prog *loader.Program, stdLib map[string]bool) {
 }
 
 func getGoFiles() (gofiles, rest []string) {
-	for i, arg := range runTestFlags.Args() {
+	for i, arg := range runFlags.Args() {
 		if arg == "--" {
-			rest = runTestFlags.Args()[i+1:]
+			rest = runFlags.Args()[i+1:]
 			break
 		}
 		if !strings.HasSuffix(arg, ".go") {
-			rest = runTestFlags.Args()[i:]
+			rest = runFlags.Args()[i:]
 			break
 		}
 		gofiles = append(gofiles, arg)
@@ -417,16 +516,24 @@ func getwd() string {
 	return cwd
 }
 
+func abs(s string) string {
+	res, err := filepath.Abs(s)
+	if err != nil {
+		logFatal("failed to make output path absolute")
+	}
+	return res
+}
+
 func mapPkgsToTmpDir(pkgs []string) []string {
 	result := make([]string, len(pkgs))
 	cwd := getwd()
 	for i, pkg := range pkgs {
-		result[i] = findUnderGopath(cwd, pkg)
+		result[i], _ = findUnderGopath(cwd, pkg)
 	}
 	return result
 }
 
-func findUnderGopath(cwd, pkg string) string {
+func findUnderGopath(cwd, pkg string) (string, string) {
 	found, err := build.Import(pkg, cwd, build.FindOnly)
 	if err != nil {
 		logFatalf("Failed to find package %q in findUnderGopath. This is probably a bug -- please report it at https://github.com/mailgun/godebug/issues/new. Thanks!", pkg)
@@ -434,7 +541,7 @@ func findUnderGopath(cwd, pkg string) string {
 	if found.SrcRoot == "" || found.ImportPath == "" {
 		logFatalf("Looks like package %q is not in a GOPATH workspace. godebug doesn't support it right now, but if you open a ticket at https://github.com/mailgun/godebug/issues/new we'll fix it soon. Thanks!", pkg)
 	}
-	return found.ImportPath
+	return found.ImportPath, found.Dir
 }
 
 func mapToTmpDir(tmpDir string, gofiles []string) []string {
@@ -487,8 +594,27 @@ func doOutput(args []string) {
 	})
 }
 
-func parseTestArguments(args []string) (packages, testFlags []string) {
-	// format: [-godebugwork] [-instrument pkgs...] [packages] [testFlags]
+func parseBuildArguments(args []string) ([]string, bool) {
+	if len(args) == 0 {
+		return []string{"."}, true
+	}
+	if len(args) == 1 && !strings.HasSuffix(args[0], ".go") {
+		return args, true
+	}
+	for _, a := range args {
+		if !strings.HasSuffix(a, ".go") {
+			logFatal("you can only build a set of files or a single package")
+		}
+	}
+	return args, false
+}
+
+func isFlag(arg, name string) bool {
+	return arg == name || strings.HasPrefix(arg, name+"=")
+}
+
+func parseTestArguments(args []string) (packages, otherFlags []string) {
+	// format: [-godebugwork] [-instrument pkgs...] [-o=...] [-c] [packages] [testFlags]
 
 	// Find first unrecognized flag.
 	sep := len(args)
@@ -497,15 +623,18 @@ func parseTestArguments(args []string) (packages, testFlags []string) {
 			arg = arg[1:]
 		}
 		if strings.HasPrefix(arg, "-") &&
-			!strings.HasPrefix(arg, "-instrument") &&
-			!strings.HasPrefix(arg, "-godebugwork") {
+			!isFlag(arg, "-instrument") &&
+			!isFlag(arg, "-godebugwork") &&
+			!isFlag(arg, "-tags") &&
+			!isFlag(arg, "-o") &&
+			!isFlag(arg, "-c") {
 			sep = i
 			break
 		}
 	}
 
-	exitIfErr(runTestFlags.Parse(args[:sep]))
-	return runTestFlags.Args(), args[sep:]
+	exitIfErr(testFlags.Parse(args[:sep]))
+	return testFlags.Args(), args[sep:]
 }
 
 var (
