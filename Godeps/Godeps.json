@@ -1,6 +1,6 @@
 {
 	"ImportPath": "github.com/mailgun/godebug",
-	"GoVersion": "go1.4.2",
+	"GoVersion": "go1.4.1",
 	"Packages": [
 		"./..."
 	],
@@ -8,6 +8,10 @@
 		{
 			"ImportPath": "bitbucket.org/JeremySchlatter/go-atexit",
 			"Rev": "4d24881b3b10dc2e60d3e6b3b6fce38d3bda546d"
+		},
+		{
+			"ImportPath": "github.com/0xfaded/eval",
+			"Rev": "d7460625a04165fdb12302d5b278d9c27ddbaa93"
 		},
 		{
 			"ImportPath": "github.com/jtolds/gls",
@@ -20,6 +24,10 @@
 		{
 			"ImportPath": "github.com/kylelemons/godebug/diff",
 			"Rev": "808ac284003ce2b08ef590da08f95379e8a06936"
+		},
+		{
+			"ImportPath": "github.com/peterh/liner",
+			"Rev": "1bb0d1c1a25ed393d8feb09bab039b2b1b1fbced"
 		},
 		{
 			"ImportPath": "golang.org/x/tools/go/ast/astutil",

@@ -38,7 +38,7 @@ func compileGodebug(t *testing.T) (filename string) {
 	if runtime.GOOS == "windows" {
 		exe = ".exe"
 	}
-	cmd := exec.Command("go", "build", "-o", godebug+exe)
+	cmd := exec.Command("go", "build", "-o", godebug+exe, "-ldflags="+buildModeFlag)
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
@@ -46,6 +46,15 @@ func compileGodebug(t *testing.T) (filename string) {
 		t.Fatal("failed to build godebug:", err)
 	}
 	return godebug
+}
+
+// stripTestPrefix removes the note that godebug prints when it is built in test mode.
+func stripTestPrefix(b []byte) []byte {
+	prefix := []byte("godebug: test mode build\n")
+	if !bytes.HasPrefix(b, prefix) {
+		panic("Expected test mode note, but did not get one")
+	}
+	return b[len(prefix):]
 }
 
 func readDirNames(t *testing.T, dir string) (names []string) {
@@ -164,14 +173,15 @@ func compareGolden(t *testing.T, godebug, test string) {
 		fmt.Println(buf.String())
 		t.Fatal(err)
 	}
-	if !bytes.Equal(buf.Bytes(), golden) {
+	output := stripTestPrefix(buf.Bytes())
+	if !bytes.Equal(output, golden) {
 		if *accept {
-			if err = ioutil.WriteFile(goldenOutput(test), buf.Bytes(), 0644); err != nil {
+			if err = ioutil.WriteFile(goldenOutput(test), output, 0644); err != nil {
 				t.Fatal(err)
 			}
 			return
 		}
-		t.Errorf("%s: want != got. Diff:\n%s", test, diff.Diff(string(golden), buf.String()))
+		t.Errorf("%s: want != got. Diff:\n%s", test, diff.Diff(string(golden), string(output)))
 	}
 }
 
@@ -190,6 +200,9 @@ type session struct {
 
 	// The command to run. The first element must be "godebug".
 	cmd []string
+
+	// A comment at the top of the session file.
+	comment string
 }
 
 func runGolden(t *testing.T, test, tool string, s *session) {
@@ -217,13 +230,16 @@ func checkOutput(t *testing.T, want *session, tool string, output []byte) {
 	}
 
 	if *acceptSession {
+		if want.comment != "" {
+			got = append([]byte(want.comment+"\n"), got...)
+		}
 		if err := ioutil.WriteFile(want.filename, got, 0644); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
 
-	t.Errorf("%s: Session did not match. Diff:\n%v", testName, diff.Diff(string(want.fullSession), string(got)))
+	t.Errorf("%s: Session did not match. Tool: %s, Diff:\n%v", testName, tool, diff.Diff(string(want.fullSession), string(got)))
 }
 
 var prompt = []byte("(godebug) ")
@@ -276,7 +292,8 @@ func parseSessionFromBytes(b []byte) *session {
 	}
 
 	lines := bytes.Split(b, newline)
-	lines = removeSessionComment(lines)
+	lines, comment := removeSessionComment(lines)
+	s.comment = string(bytes.Join(comment, newline))
 
 	for _, line := range lines {
 		if bytes.HasSuffix(line, []byte{'\r'}) { // convert CRLF to LF
@@ -295,13 +312,13 @@ func parseSessionFromBytes(b []byte) *session {
 
 // Scan past top of file comment. The top of file comment consists of any number of consecutive
 // lines that are either blank or begin with the string "//".
-func removeSessionComment(lines [][]byte) [][]byte {
+func removeSessionComment(lines [][]byte) (content, comment [][]byte) {
 	for i := range lines {
 		if len(lines[i]) > 0 && !bytes.HasPrefix(lines[i], []byte("//")) {
-			return lines[i:]
+			return lines[i:], lines[:i]
 		}
 	}
-	return nil
+	return nil, lines
 }
 
 func normalizeCRLF(b []byte) []byte {

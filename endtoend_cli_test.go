@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -16,9 +17,15 @@ import (
 	"github.com/mailgun/godebug/Godeps/_workspace/src/gopkg.in/yaml.v2"
 )
 
+var parallel = flag.Int("parallel-tests", 40, "Max number of CLI tests to run in parallel")
+
 // This file runs tests in the testdata directory, excluding those in testdata/single-file-tests
 
 func TestCLISessions(t *testing.T) {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+
 	godebug := compileGodebug(t)
 	defer os.Remove(godebug)
 
@@ -41,12 +48,18 @@ func TestCLISessions(t *testing.T) {
 
 	// Run tests in parallel
 	var wg sync.WaitGroup
+	// If we run too many tests at once we can exceed our file descriptor limit.
+	lim := make(chan bool, *parallel)
 	for _, test := range tests {
 		for _, tt := range parseCases(t, filepath.Join("testdata", test)) {
 			s := parseSessionFromBytes([]byte(tt.Transcript))
 			for i := range tt.Invocations {
 				wg.Add(1)
+				lim <- true
 				go func(filename string, s *session, tt testCase, i int) {
+					defer func() {
+						<-lim
+					}()
 					defer wg.Done()
 					runTest(t, godebug, filename, tt, i, s)
 				}(test, s, tt, i)
@@ -106,7 +119,8 @@ func runTest(t *testing.T, godebug, filename string, tt testCase, i int, session
 	// Because we set `logFileEnvVar` above, godebug will print the
 	// files it creates to stdout. Parse those lines and then pretend
 	// they were not printed.
-	createdFiles, output := recordCreatedFiles(buf.Bytes())
+	output := stripTestPrefix(buf.Bytes())
+	createdFiles, output := recordCreatedFiles(output)
 
 	switch err.(type) {
 	case nil:
@@ -214,15 +228,15 @@ func listToMap(list []string) map[string]bool {
 // equivalent does a linewise comparison of a and b.
 // For each line:
 //    got exactly equals want OR
-//    want ends in "//substr" and is a substring of got OR
-//    want ends in "//slashes" and runtime.GOOS == "windows" and got equals want with its slashes swapped for backslashes
+//    want ends in " //substr" and is a substring of got OR
+//    want ends in " //slashes" and runtime.GOOS == "windows" and got equals want with its slashes swapped for backslashes
 // Otherwise equivalent returns false.
 func equivalent(got, want []byte) bool {
 	var (
 		gotLines  = bytes.Split(got, newline)
 		wantLines = bytes.Split(want, newline)
-		substr    = []byte("//substr")
-		slashes   = []byte("//slashes")
+		substr    = []byte(" //substr")
+		slashes   = []byte(" //slashes")
 		slash     = []byte{'/'}
 		gg, ww    []byte
 	)

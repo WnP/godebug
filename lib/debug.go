@@ -8,86 +8,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"unicode"
+	"unsafe"
+
+	"github.com/mailgun/godebug/Godeps/_workspace/src/github.com/0xfaded/eval"
 )
 
-// Scope represents a lexical scope for variable bindings.
-type Scope struct {
-	vars, consts map[string]interface{}
-	parent       *Scope
-	fileText     []string
-}
-
-// EnteringNewScope returns a new Scope and internally sets
-// the current scope to be the returned scope.
-func EnteringNewScope(fileText string) *Scope {
-	return &Scope{
-		vars:     make(map[string]interface{}),
-		consts:   make(map[string]interface{}),
-		fileText: parseLines(fileText),
-	}
-}
-
-func parseLines(text string) []string {
-	lines := strings.Split(text, "\n")
-
-	// Trailing newline is not a separate line
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-
-	return lines
-}
-
-// EnteringNewChildScope returns a new Scope that is the
-// child of s and internally sets the current scope to be
-// the returned scope.
-func (s *Scope) EnteringNewChildScope() *Scope {
-	return &Scope{
-		vars:     make(map[string]interface{}),
-		consts:   make(map[string]interface{}),
-		parent:   s,
-		fileText: s.fileText,
-	}
-}
-
-func (s *Scope) getIdent(name string) (i interface{}, ok bool) {
-	// TODO: This can race with other goroutines setting the value you are printing.
-	for scope := s; scope != nil; scope = scope.parent {
-		if i, ok = scope.vars[name]; ok {
-			return dereference(i), true
-		}
-		if i, ok = scope.consts[name]; ok {
-			return i, true
-		}
-	}
-	return nil, false
-}
-
-// Declare creates new variable bindings in s from a list of name, value pairs.
-// The values should be pointers to the values in the program rather than copies
-// of them so that s can track changes to them.
-func (s *Scope) Declare(namevalue ...interface{}) {
-	s.addIdents(s.vars, "Declare", namevalue...)
-}
-
-// Constant is like Declare, but for constants. The values must be passed directly.
-func (s *Scope) Constant(namevalue ...interface{}) {
-	s.addIdents(s.consts, "Constant", namevalue...)
-}
-
-func (s *Scope) addIdents(to map[string]interface{}, funcName string, namevalue ...interface{}) {
-	var i int
-	for i = 0; i+1 < len(namevalue); i += 2 {
-		name, ok := namevalue[i].(string)
-		if !ok {
-			panic(fmt.Sprintf("programming error: got odd-numbered argument to %s that was not a string", funcName))
-		}
-		to[name] = namevalue[i+1]
-	}
-	if i != len(namevalue) {
-		panic(fmt.Sprintf("programming error: called %s with odd number of arguments", funcName))
-	}
-}
+var buildMode = "" // overwritten by -ldflags in tests
 
 const (
 	run int32 = iota
@@ -353,7 +279,7 @@ Commands:
     (s) step: Run for one step.
     (c) continue: Run until the next breakpoint.
     (l) list: Show the current line in context of the code around it.
-    (p) print [<format-specifier>] <var>: Print a variable, optionaly use printf format specifier.
+    (p) print [<format-specifier>] <expression>: Print a variable or any other Go expression, optionaly use printf format specifier.
     (q) quit: Exit the program. Uses os.Exit; deferred functions are not run.
 
 Commands may be given by their full name or by their parenthesized abbreviation.
@@ -398,21 +324,49 @@ func waitForInput(scope *Scope, line int) {
 			os.Exit(0)
 		}
 		fields := strings.Fields(s)
+		specifier := ""
 		if len(fields) > 0 && (fields[0] == "p" || fields[0] == "print") {
-			if len(fields) == 2 || len(fields) == 3 {
-				if v, ok := scope.getIdent(strings.TrimSpace(fields[len(fields)-1])); ok {
-					if len(fields) == 3 {
-						fmt.Printf(fields[1]+"\n", v)
-					} else {
-						fmt.Printf("%#v\n", v)
+			if len(fields) > 1 && len(fields[1]) > 0 && fields[1][0] == '%' {
+				specifier = fields[1]
+			}
+			if (len(fields) > 1 && len(specifier) == 0) || (len(fields) > 2 && len(specifier) > 0) {
+				index := 1
+				if len(specifier) > 0 {
+					index = 2
+				}
+				results, panik, compileErrs := goEval(strings.Join(fields[index:], " "), scope)
+				switch {
+				case compileErrs != nil:
+					for _, err := range compileErrs {
+						fmt.Println(err)
 					}
-				} else {
-					fmt.Printf(
-						"%s is not in scope (or is in package scope). Can't print it.\n",
-						fields[len(fields)-1])
+				case panik != nil:
+					fmt.Printf("panic (recovered): %v\n", panik)
+				default:
+					s := make([]string, len(results))
+					for i, r := range results {
+						if !r.CanInterface() {
+							if r.CanAddr() {
+								r = reflect.NewAt(r.Type(), unsafe.Pointer(r.UnsafeAddr())).Elem()
+							} else {
+								s[i] = fmt.Sprintf("godebug cannot access this field or method. Sorry! Let us know about it at github.com/mailgun/godebug/issues/new and we'll fix it")
+							}
+						}
+						ifc := r.Interface()
+						if len(specifier) > 0 {
+							s[i] = fmt.Sprintf(specifier, ifc)
+						} else {
+							if _, ok := ifc.(*eval.ConstNumber); ok {
+								s[i] = fmt.Sprintf("%v", ifc)
+							} else {
+								s[i] = fmt.Sprintf("%#v", ifc)
+							}
+						}
+					}
+					fmt.Println(strings.Join(s, ", "))
 				}
 			} else {
-				fmt.Println("usage: print [<format-specifier>] <var>")
+				fmt.Println("usage: print [<format-specifier>] <expression>")
 			}
 			continue
 		}
@@ -421,6 +375,24 @@ func waitForInput(scope *Scope, line int) {
 			fmt.Printf("If you want to print the variable %s, use the print command.\n", strings.TrimSpace(s))
 		}
 	}
+}
+
+// goEval runs eval.EvalEnv in a new goroutine. This is a quick hack to
+// keep the debugger from pausing while running eval.EvalEnv.
+// It is also used to recover from panics in the eval library.
+func goEval(expr string, env eval.Env) (result []reflect.Value, panik error, compileErrors []error) {
+	c := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panik = fmt.Errorf("%v", r)
+			}
+			close(c)
+		}()
+		result, panik, compileErrors = eval.EvalEnv(expr, env)
+	}()
+	<-c
+	return
 }
 
 func dereference(i interface{}) interface{} {
@@ -445,11 +417,14 @@ func printContext(lines []string, line, contextCount int) {
 
 var input = bufio.NewScanner(os.Stdin)
 
-// This gets overridden when running in a browser.
-var promptUser = func() (response string, ok bool) {
+func fallbackPrompt() (response string, ok bool) {
 	fmt.Print("(godebug) ")
 	if !input.Scan() {
 		return "", false
 	}
 	return input.Text(), true
 }
+
+// This gets overridden when running in a browser or in a terminal supported
+// by our readline package.
+var promptUser = fallbackPrompt

@@ -1,5 +1,9 @@
-godebug  [![build](https://img.shields.io/badge/build-passing-green.svg)](https://godebug-cross-platform-ci.appspot.com/)
+godebug
+
 -------
+[![Linux Build Status](https://img.shields.io/travis/mailgun/godebug/master.svg?label=linux)](https://travis-ci.org/mailgun/godebug)
+[![Windows Build Status](https://img.shields.io/appveyor/ci/jeremyschlatter/godebug/master.svg?label=windows)](https://ci.appveyor.com/project/jeremyschlatter/godebug/branch/master)
+
 
 A cross-platform debugger for Go.
 
@@ -49,15 +53,15 @@ That's it. See 'godebug help' for the full usage.
 
 The current commands are:
 
-command       | result
---------------|------------------------
-h(elp)        | show help message
-n(ext)        | run the next line
-s(tep)        | run for one step
-c(ontinue)    | run until the next breakpoint
-l(ist)        | show the current line in context of the code around it
-p(rint) [var] | print a variable
-q(uit)        | exit the program
+command              | result
+---------------------|------------------------
+h(elp)               | show help message
+n(ext)               | run the next line
+s(tep)               | run for one step
+c(ontinue)           | run until the next breakpoint
+l(ist)               | show the current line in context of the code around it
+p(rint) [expression] | print a variable or any other Go expression
+q(uit)               | exit the program
 
 ### Caveats
 
